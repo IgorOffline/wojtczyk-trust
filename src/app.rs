@@ -640,6 +640,13 @@ impl App {
         }
 
         let label = label.into();
+        let path = match secure_existing_project_path(&self.root, &path, false) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Open failed: {error}");
+                return false;
+            }
+        };
         match Editor::open(&path) {
             Ok(editor) => {
                 self.editor = editor;
@@ -763,6 +770,11 @@ impl App {
     }
 
     fn save_editor(&mut self) -> io::Result<()> {
+        let path = self
+            .editor
+            .path()
+            .ok_or_else(|| io::Error::other("scratch buffer has no path"))?;
+        secure_existing_project_path(&self.root, path, false)?;
         self.editor.save()?;
         let label = self.current_file_label();
         self.status = format!("Saved {label}");
@@ -1324,14 +1336,21 @@ impl App {
             return;
         }
 
-        let target = self.browser_dir.join(requested);
+        let browser_dir = match secure_existing_project_path(&self.root, &self.browser_dir, true) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = format!("Could not create file: {error}");
+                return;
+            }
+        };
+        let target = browser_dir.join(requested);
         let parent = target
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.browser_dir.clone());
 
-        if let Err(error) = fs::create_dir_all(&parent) {
-            self.status = format!("Could not create parent directory: {error}");
+        if let Err(error) = secure_create_project_dir(&self.root, &parent) {
+            self.status = format!("Could not create file: {error}");
             return;
         }
 
@@ -2340,6 +2359,94 @@ fn is_project_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn secure_existing_project_path(
+    root: &Path,
+    path: &Path,
+    expect_directory: bool,
+) -> io::Result<PathBuf> {
+    let root = root.canonicalize()?;
+    let canonical = path.canonicalize()?;
+    let relative = canonical.strip_prefix(&root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path is outside the project",
+        )
+    })?;
+
+    let mut current = root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "path contains an unsafe component",
+            ));
+        };
+        current.push(component);
+        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "symbolic links are not allowed in project paths",
+            ));
+        }
+    }
+
+    if expect_directory && !canonical.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a directory",
+        ));
+    }
+    if !expect_directory && !canonical.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a file",
+        ));
+    }
+    if expect_directory {
+        Ok(canonical)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
+fn secure_create_project_dir(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let root = root.canonicalize()?;
+    let relative = path.strip_prefix(&root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path is outside the project",
+        )
+    })?;
+    let mut current = root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "path contains an unsafe component",
+            ));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "symbolic links are not allowed in project paths",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path component is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(error),
+        }
+    }
+    secure_existing_project_path(&root, &current, true)
+}
+
 fn contains(area: Rect, column: u16, row: u16) -> bool {
     contains_x(area, column) && contains_y(area, row)
 }
@@ -2886,5 +2993,27 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_project_paths_containing_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_project("reject-symlinks");
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.rs"), "secret").unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+
+        assert!(
+            super::secure_existing_project_path(&root, &root.join("linked/secret.rs"), false)
+                .is_err()
+        );
+        assert!(super::secure_create_project_dir(&root, &root.join("linked/nested")).is_err());
+        assert!(!outside.join("nested").exists());
+
+        let _ = fs::remove_dir_all(outside);
+        let _ = fs::remove_dir_all(root);
     }
 }

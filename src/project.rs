@@ -56,7 +56,9 @@ pub fn list_project_dir(root: &Path, dir: &Path) -> Vec<ProjectEntry> {
             continue;
         };
 
-        if file_type.is_dir() {
+        if file_type.is_symlink() {
+            continue;
+        } else if file_type.is_dir() {
             if should_skip_dir(&path) {
                 continue;
             }
@@ -109,4 +111,33 @@ fn should_skip_dir(path: &Path) -> bool {
                 ".git" | ".idea" | ".vscode" | "target" | "node_modules" | ".direnv"
             )
         })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::list_project_dir;
+
+    #[test]
+    fn project_listing_ignores_symbolic_links() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("trust-project-symlink-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let outside = root.with_extension("outside.rs");
+        fs::write(&outside, "secret").unwrap();
+        symlink(&outside, root.join("linked.rs")).unwrap();
+
+        assert!(list_project_dir(&root, &root).is_empty());
+
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
+    }
 }

@@ -1,8 +1,8 @@
 use std::{
     collections::{BTreeSet, HashSet},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use crate::{editor::Editor, project::ProjectEntry};
 
 const COMPLETION_LIMIT: usize = 24;
+const MAX_LSP_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CompletionCandidate {
@@ -314,6 +315,7 @@ struct LanguageClient {
     child: Child,
     writer: Arc<Mutex<ChildStdin>>,
     incoming: mpsc::Receiver<Value>,
+    stderr: Arc<Mutex<String>>,
     next_id: u64,
     versions: Vec<(PathBuf, i32)>,
 }
@@ -323,7 +325,7 @@ impl LanguageClient {
         let mut child = Command::new("rust-analyzer")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         let stdin = child
@@ -334,9 +336,24 @@ impl LanguageClient {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("rust-analyzer stdout unavailable"))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("rust-analyzer stderr unavailable"))?;
 
         let writer = Arc::new(Mutex::new(stdin));
         let (sender, incoming) = mpsc::channel();
+        let stderr_output = Arc::new(Mutex::new(String::new()));
+        let stderr_capture = Arc::clone(&stderr_output);
+        std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = stderr.read_to_string(&mut output);
+            if !output.trim().is_empty()
+                && let Ok(mut captured) = stderr_capture.lock()
+            {
+                *captured = output;
+            }
+        });
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -358,6 +375,7 @@ impl LanguageClient {
             child,
             writer,
             incoming,
+            stderr: stderr_output,
             next_id: 1,
             versions: Vec::new(),
         };
@@ -481,9 +499,22 @@ impl LanguageClient {
                 ));
             };
 
-            let message = self.incoming.recv_timeout(remaining).map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "rust-analyzer did not reply")
-            })?;
+            let poll = remaining.min(Duration::from_millis(100));
+            let message = match self.incoming.recv_timeout(poll) {
+                Ok(message) => message,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(status) = self.child.try_wait()? {
+                        return Err(language_server_exit_error(status, &self.stderr));
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(status) = self.child.try_wait()? {
+                        return Err(language_server_exit_error(status, &self.stderr));
+                    }
+                    return Err(io::Error::other("rust-analyzer stopped replying"));
+                }
+            };
 
             let message_id = message.get("id").and_then(Value::as_u64);
             if message_id == Some(id) {
@@ -494,6 +525,22 @@ impl LanguageClient {
             }
         }
     }
+}
+
+fn language_server_exit_error(status: ExitStatus, stderr: &Arc<Mutex<String>>) -> io::Error {
+    let stderr = stderr
+        .lock()
+        .ok()
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty());
+    let mut message = match stderr {
+        Some(output) => format!("rust-analyzer exited with {status}: {output}"),
+        None => format!("rust-analyzer exited with {status}"),
+    };
+    if message.contains("Unknown binary 'rust-analyzer'") {
+        message.push_str("; install it with `rustup component add rust-analyzer`");
+    }
+    io::Error::other(message)
 }
 
 impl Drop for LanguageClient {
@@ -634,6 +681,12 @@ fn read_lsp_message(reader: &mut impl BufRead) -> io::Result<Option<String>> {
             "missing LSP content length",
         ));
     };
+    if content_length > MAX_LSP_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "LSP message exceeds the 16 MiB size limit",
+        ));
+    }
 
     let mut payload = vec![0; content_length];
     reader.read_exact(&mut payload)?;
@@ -660,14 +713,21 @@ fn path_to_uri(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{io::Cursor, path::Path};
 
     use serde_json::json;
 
     use super::{
-        CompletionEngine, CompletionKind, fallback_items, initialize_params,
-        strip_snippet_placeholders,
+        CompletionEngine, CompletionKind, MAX_LSP_MESSAGE_SIZE, fallback_items, initialize_params,
+        read_lsp_message, strip_snippet_placeholders,
     };
+
+    #[test]
+    fn rejects_oversized_lsp_messages_before_allocating_payload() {
+        let input = format!("Content-Length: {}\r\n\r\n", MAX_LSP_MESSAGE_SIZE + 1);
+        let error = read_lsp_message(&mut Cursor::new(input)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     #[test]
     fn strips_lsp_snippet_placeholders() {
