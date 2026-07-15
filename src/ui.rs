@@ -735,7 +735,7 @@ fn draw_dialog(frame: &mut Frame, app: &App, dialog: Dialog, area: Rect) {
     frame.render_widget(Clear, area);
     let title = match dialog {
         Dialog::About => " About TRUST ",
-        Dialog::CompileResult => " Cargo Result ",
+        Dialog::CompileResult => " Compiler Result ",
         Dialog::Find => " Find ",
         Dialog::NewFile => " New File ",
         Dialog::NewProject => " New Project ",

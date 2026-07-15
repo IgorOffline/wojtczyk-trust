@@ -8,6 +8,8 @@ use std::{
 
 use serde::Deserialize;
 
+use crate::compiler::{SingleFileAction, compile_single_file};
+
 #[derive(Debug, Clone)]
 pub struct SourceLocation {
     pub path: PathBuf,
@@ -31,8 +33,37 @@ pub struct DebuggerSession {
 impl DebuggerSession {
     pub fn start(root: &Path, breakpoints: &[SourceLocation]) -> io::Result<Self> {
         let binary = build_debug_binary(root)?;
+        Self::start_binary(root, root, &binary, breakpoints)
+    }
+
+    pub fn start_single_file(
+        root: &Path,
+        source: &Path,
+        breakpoints: &[SourceLocation],
+    ) -> io::Result<Self> {
+        let compilation = compile_single_file(root, source, SingleFileAction::Build)?;
+        if !compilation.output.status.success() {
+            return Err(io::Error::other(format!(
+                "rustc failed:\n{}",
+                String::from_utf8_lossy(&compilation.output.stderr)
+            )));
+        }
+        let binary = compilation
+            .binary
+            .ok_or_else(|| io::Error::other("rustc did not produce a debug binary"))?;
+        let run_dir = source.parent().unwrap_or(root);
+        Self::start_binary(root, run_dir, &binary, breakpoints)
+    }
+
+    fn start_binary(
+        root: &Path,
+        run_dir: &Path,
+        binary: &Path,
+        breakpoints: &[SourceLocation],
+    ) -> io::Result<Self> {
         let mut child = Command::new("lldb")
-            .arg(&binary)
+            .arg(binary)
+            .current_dir(run_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

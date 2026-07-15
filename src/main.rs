@@ -1,5 +1,6 @@
 mod app;
 mod clipboard;
+mod compiler;
 mod debugger;
 mod editor;
 mod ide;

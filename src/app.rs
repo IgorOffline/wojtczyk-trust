@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::{
+    compiler::{SingleFileAction, compile_single_file},
     debugger::{DebuggerEvent, DebuggerSession, SourceLocation},
     editor::{Editor, Position},
     ide::{CompletionCandidate, CompletionEngine, CompletionResponse},
@@ -709,7 +710,12 @@ impl App {
     pub fn run_cargo(&mut self, command: &str) {
         self.close_menu();
         self.close_completion();
-        if !self.save_dirty_before("Cargo command") {
+        if !self.save_dirty_before("Compiler command") {
+            return;
+        }
+
+        if !self.root.join("Cargo.toml").is_file() {
+            self.run_single_file(command);
             return;
         }
 
@@ -752,6 +758,85 @@ impl App {
                 self.push_message(self.status.clone());
             }
         }
+    }
+
+    fn run_single_file(&mut self, command: &str) {
+        let Some(source) = self.editor.path().map(Path::to_path_buf) else {
+            self.status = "Single-file mode requires an open Rust file".to_string();
+            return;
+        };
+        if source.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+            self.status = "Single-file mode requires an open .rs file".to_string();
+            return;
+        }
+
+        let action = match command {
+            "check" => SingleFileAction::Check,
+            "test" => SingleFileAction::Test,
+            "run" | "build" => SingleFileAction::Build,
+            _ => {
+                self.status = format!("Unsupported single-file command: {command}");
+                return;
+            }
+        };
+        self.push_message(format!("$ rustc --edition=2024 {}", source.display()));
+        self.status = format!("Running rustc {command}...");
+        self.dialog = None;
+
+        match compile_single_file(&self.root, &source, action) {
+            Ok(compilation) => {
+                self.push_process_output(&compilation.output.stdout, &compilation.output.stderr);
+                if !compilation.output.status.success() {
+                    self.finish_single_file_command(command, compilation.output.status.success());
+                    return;
+                }
+
+                if matches!(command, "run" | "test") {
+                    let Some(binary) = compilation.binary else {
+                        self.status = "rustc did not produce an executable".to_string();
+                        return;
+                    };
+                    self.push_message(format!("$ {}", binary.display()));
+                    match Command::new(&binary)
+                        .current_dir(source.parent().unwrap_or(&self.root))
+                        .output()
+                    {
+                        Ok(output) => {
+                            self.push_process_output(&output.stdout, &output.stderr);
+                            self.finish_single_file_command(command, output.status.success());
+                        }
+                        Err(error) => {
+                            self.status = format!("Could not run compiled file: {error}");
+                            self.push_message(self.status.clone());
+                        }
+                    }
+                } else {
+                    self.finish_single_file_command(command, true);
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not run rustc: {error}");
+                self.push_message(self.status.clone());
+            }
+        }
+    }
+
+    fn push_process_output(&mut self, stdout: &[u8], stderr: &[u8]) {
+        let mut lines = output_lines(stdout);
+        lines.extend(output_lines(stderr));
+        for line in lines {
+            self.push_message(line);
+        }
+    }
+
+    fn finish_single_file_command(&mut self, command: &str, success: bool) {
+        self.status = if success {
+            format!("rustc {command} finished successfully")
+        } else {
+            format!("rustc {command} failed")
+        };
+        self.dialog = Some(Dialog::CompileResult);
+        self.focus = Focus::Messages;
     }
 
     fn save_dirty_before(&mut self, action: &str) -> bool {
@@ -913,11 +998,31 @@ impl App {
             .collect::<Vec<_>>();
         let breakpoint_count = breakpoints.len();
 
-        self.push_message("$ cargo build");
+        let single_file = if self.root.join("Cargo.toml").is_file() {
+            None
+        } else {
+            let Some(path) = self.editor.path().map(Path::to_path_buf) else {
+                self.status = "Single-file debugging requires an open Rust file".to_string();
+                return;
+            };
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                self.status = "Single-file debugging requires an open .rs file".to_string();
+                return;
+            }
+            Some(path)
+        };
+        if let Some(source) = &single_file {
+            self.push_message(format!("$ rustc -g --edition=2024 {}", source.display()));
+        } else {
+            self.push_message("$ cargo build");
+        }
         let root = self.root.clone();
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = DebuggerSession::start(&root, &breakpoints);
+            let result = match single_file {
+                Some(source) => DebuggerSession::start_single_file(&root, &source, &breakpoints),
+                None => DebuggerSession::start(&root, &breakpoints),
+            };
             let _ = sender.send(result);
         });
         self.debug_start = Some(DebugStartJob {

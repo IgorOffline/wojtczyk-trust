@@ -4,7 +4,8 @@ TRUST is a retro TUI IDE for Rust projects inspired by classic blue-screen DOS
 development environments.
 
 Status: experimental nostalgia project. It edits files, browses Rust projects,
-and runs Cargo commands.
+and runs Cargo commands. In directories without a root `Cargo.toml`, it can
+also compile, run, test, and debug the current Rust file directly with `rustc`.
 
 ## New IDE Features
 
@@ -62,11 +63,11 @@ If no path is supplied, TRUST opens the current directory.
 - `F3` / `Ctrl+O`: open selected file
 - `Backspace`: go to the parent directory in the project pane
 - `F4`: cycle focus
-- `F5` / `Ctrl+R`: `cargo run`
+- `F5` / `Ctrl+R`: run through Cargo, or compile and run the current standalone file
 - `F6`: toggle breakpoint on the current line
-- `F7`: `cargo check`
-- `F8` / `Ctrl+T`: `cargo test`
-- `F9` / `Ctrl+B`: `cargo build`
+- `F7`: check through Cargo or `rustc`
+- `F8` / `Ctrl+T`: test through Cargo or a `rustc --test` harness
+- `F9` / `Ctrl+B`: build through Cargo or `rustc`
 - `F10`: open the menu bar
 - `Ctrl+Z`: undo
 - `Ctrl+Y` / `Ctrl+Shift+Z`: redo
@@ -123,3 +124,14 @@ If no path is supplied, TRUST opens the current directory.
 The project pane lists directories plus editable Rust and Cargo-related files
 such as `.rs`, `.toml`, and `.lock`, while skipping `.git`, `target`, and common
 editor/build directories. Compiler output is captured in the bottom pane.
+
+## TODO: Vi editing mode
+
+Three possible implementation scopes are retained for future work:
+
+1. **Basic modal editing:** Normal/Insert modes, core motions, line operations,
+   paste, undo/redo, and a visible mode indicator.
+2. **Everyday-use vi mode:** operator-plus-motion commands, counts, word
+   motions, Visual modes, registers, repeat, and search integration.
+3. **High-fidelity Vim mode:** text objects, marks, macros, named registers,
+   command-line substitutions, and nuanced command compatibility.
